@@ -17,6 +17,7 @@
 package com.google.maps.android.clustering.algo;
 
 import com.google.android.gms.maps.model.LatLng;
+import com.google.android.gms.maps.model.LatLngBounds;
 import com.google.maps.android.clustering.Cluster;
 import com.google.maps.android.clustering.ClusterItem;
 
@@ -28,11 +29,11 @@ import java.util.List;
  * A cluster whose center is determined upon creation.
  */
 public class StaticCluster<T extends ClusterItem> implements Cluster<T> {
-    private final LatLng mCenter;
+    private LatLng mCenter;
+    private LatLngBounds mBounds = null;
     private final List<T> mItems = new ArrayList<T>();
 
-    public StaticCluster(LatLng center) {
-        mCenter = center;
+    public StaticCluster() {
     }
 
     public boolean add(T t) {
@@ -42,6 +43,10 @@ public class StaticCluster<T extends ClusterItem> implements Cluster<T> {
     @Override
     public LatLng getPosition() {
         return mCenter;
+    }
+    
+    public LatLngBounds getBounds() {
+        return mBounds;
     }
 
     public boolean remove(T t) {
@@ -56,6 +61,27 @@ public class StaticCluster<T extends ClusterItem> implements Cluster<T> {
     @Override
     public int getSize() {
         return mItems.size();
+    }
+    
+    public void update() {
+        synchronized(mItems) {
+            if (mItems.size() == 1) {
+                final LatLng pos = mItems.get(0).getPosition();
+                mBounds = null;
+                mCenter = pos;
+            } else {
+                for (T item : mItems) {
+                    final LatLng pos = item.getPosition();
+                    if (mBounds == null) {
+                        mBounds = new LatLngBounds(pos, pos);
+                    } else {
+                        mBounds = mBounds.including(pos);
+                    }
+                }
+                mCenter = mBounds.getCenter();
+            }
+            
+        }
     }
 
     @Override

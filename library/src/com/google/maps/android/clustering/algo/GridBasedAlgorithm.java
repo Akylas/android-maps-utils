@@ -23,6 +23,8 @@ import java.util.Set;
 
 import android.support.v4.util.LongSparseArray;
 
+import com.google.android.gms.maps.model.LatLng;
+import com.google.android.gms.maps.model.LatLngBounds;
 import com.google.maps.android.clustering.Cluster;
 import com.google.maps.android.clustering.ClusterItem;
 import com.google.maps.android.geometry.Point;
@@ -32,7 +34,7 @@ import com.google.maps.android.projection.SphericalMercatorProjection;
  * Groups markers into a grid.
  */
 public class GridBasedAlgorithm<T extends ClusterItem> implements Algorithm<T> {
-    private static final int GRID_SIZE = 100;
+    private int gridSize = 100;
 
     private final Set<T> mItems = Collections.synchronizedSet(new HashSet<T>());
 
@@ -55,10 +57,22 @@ public class GridBasedAlgorithm<T extends ClusterItem> implements Algorithm<T> {
     public void removeItem(T item) {
         mItems.remove(item);
     }
+    
+    protected StaticCluster<T> createCluster() {
+            return new StaticCluster<T>();
+    }
 
     @Override
-    public Set<? extends Cluster<T>> getClusters(double zoom) {
-        long numCells = (long) Math.ceil(256 * Math.pow(2, zoom) / GRID_SIZE);
+    public Set<? extends Cluster<T>> getClusters(double zoom, LatLngBounds visibleBounds) {
+        if (mItems.size() == 0) {
+            return null;
+        }
+        double minZoom = getMinZoom();
+        double maxZoom = getMaxZoom();
+        if ((minZoom >= 0 && zoom < minZoom) || (maxZoom >= 0 && zoom > maxZoom)) {
+            return null;
+        }
+        long numCells = (long) Math.ceil(256 * Math.pow(2, zoom) / gridSize);
         SphericalMercatorProjection proj = new SphericalMercatorProjection(numCells);
 
         HashSet<Cluster<T>> clusters = new HashSet<Cluster<T>>();
@@ -66,17 +80,35 @@ public class GridBasedAlgorithm<T extends ClusterItem> implements Algorithm<T> {
 
         synchronized (mItems) {
             for (T item : mItems) {
-                Point p = proj.toPoint(item.getPosition());
+                LatLng pos = item.getPosition();
+//                if (!visibleBounds.contains(pos) || !item.isVisible()) {
+                if (!item.isVisible()) {
+                    continue;
+                }
+                
+                if (!item.canBeClustered()) {
+                    StaticCluster<T> cluster = createCluster();
+                    cluster.add(item);
+                    clusters.add(cluster);
+                    continue;
+                }
+                Point p = proj.toPoint(pos);
 
                 long coord = getCoord(numCells, p.x, p.y);
 
                 StaticCluster<T> cluster = sparseArray.get(coord);
                 if (cluster == null) {
-                    cluster = new StaticCluster<T>(proj.toLatLng(new Point(Math.floor(p.x) + .5, Math.floor(p.y) + .5)));
+                    cluster = createCluster();
                     sparseArray.put(coord, cluster);
                     clusters.add(cluster);
                 }
                 cluster.add(item);
+            }
+        }
+        
+        for (Cluster<T> cluster: clusters) {
+            if (cluster instanceof StaticCluster) {
+                ((StaticCluster<T>) cluster).update();
             }
         }
 
@@ -90,5 +122,37 @@ public class GridBasedAlgorithm<T extends ClusterItem> implements Algorithm<T> {
 
     private static long getCoord(long numCells, double x, double y) {
         return (long) (numCells * Math.floor(x) + Math.floor(y));
+    }
+    
+    public void setGridSize(int size) {
+        gridSize = size;
+    }
+
+    @Override
+    public void removeItemsNotInRectangle(LatLngBounds bounds) {
+        synchronized (mItems) {
+            Set<T> toRemove = Collections.synchronizedSet(new HashSet<T>());
+            for (T item : mItems) {
+                if (!bounds.contains(item.getPosition())) {
+                    toRemove.add(item);
+                }
+            }
+            mItems.removeAll(toRemove);
+        }
+    }
+
+    @Override
+    public void removeItems(Collection<T> items) {
+        synchronized (mItems) {
+           mItems.removeAll(items);
+        }
+    }
+    
+    protected double getMinZoom() {
+        return -1;
+    }
+
+    protected double getMaxZoom() {
+        return -1;
     }
 }

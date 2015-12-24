@@ -33,6 +33,7 @@ import android.os.Handler;
 import android.os.Looper;
 import android.os.Message;
 import android.os.MessageQueue;
+import android.support.v4.util.Pair;
 import android.util.SparseArray;
 import android.view.ViewGroup;
 import android.view.animation.DecelerateInterpolator;
@@ -45,20 +46,22 @@ import com.google.android.gms.maps.model.LatLng;
 import com.google.android.gms.maps.model.LatLngBounds;
 import com.google.android.gms.maps.model.Marker;
 import com.google.android.gms.maps.model.MarkerOptions;
-import com.google.maps.android.MarkerManager;
 import com.google.maps.android.R;
 import com.google.maps.android.clustering.Cluster;
 import com.google.maps.android.clustering.ClusterItem;
 import com.google.maps.android.clustering.ClusterManager;
+import com.google.maps.android.clustering.algo.Algorithm;
 import com.google.maps.android.geometry.Point;
 import com.google.maps.android.projection.SphericalMercatorProjection;
 import com.google.maps.android.ui.SquareTextView;
 import com.google.maps.android.ui.IconGenerator;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Map;
@@ -82,12 +85,14 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
 
     private static final int[] BUCKETS = {10, 20, 50, 100, 200, 500, 1000};
     private ShapeDrawable mColoredCircleBackground;
+    
+    public static final int ANIMATION_MOVE = 0;
+    public static final int ANIMATION_FADE = 1;
 
     /**
      * Markers that are currently on the map.
      */
-    private Set<MarkerWithPosition> mMarkers = Collections.newSetFromMap(
-            new ConcurrentHashMap<MarkerWithPosition, Boolean>());
+    private HashMap<Algorithm, Set<MarkerWithPosition>> mMarkers = new HashMap<>();
 
     /**
      * Icons for each bucket.
@@ -107,7 +112,7 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
     /**
      * The currently displayed set of clusters.
      */
-    private Set<? extends Cluster<T>> mClusters;
+    private HashMap<Algorithm<T>, Set<? extends Cluster<T>>> mClusters = new HashMap<>();
 
     /**
      * Lookup between markers and the associated cluster.
@@ -135,6 +140,11 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
         mIconGenerator.setTextAppearance(R.style.ClusterIcon_TextAppearance);
         mIconGenerator.setBackground(makeClusterBackground());
         mClusterManager = clusterManager;
+    }
+    
+    protected boolean shouldAnimate() {
+        return SHOULD_ANIMATE;
+//        return false;
     }
 
     @Override
@@ -241,7 +251,7 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
         private static final int RUN_TASK = 0;
         private static final int TASK_FINISHED = 1;
         private boolean mViewModificationInProgress = false;
-        private RenderTask mNextClusters = null;
+        private ArrayDeque<RenderTask> mNextClusters = null;
 
         @Override
         public void handleMessage(Message msg) {
@@ -259,16 +269,19 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
                 // Busy - wait for the callback.
                 return;
             }
-
-            if (mNextClusters == null) {
+            if (mNextClusters == null || mNextClusters.size() == 0) {
                 // Nothing to do.
                 return;
             }
-
-            RenderTask renderTask;
+            RenderTask renderTask = null;
             synchronized (this) {
-                renderTask = mNextClusters;
-                mNextClusters = null;
+                renderTask = mNextClusters.pop();
+                if (renderTask == null) {
+                    // Nothing to do.
+                    return;
+                }
+//                renderTask = mNextClusters;
+//                mNextClusters = null;
                 mViewModificationInProgress = true;
             }
 
@@ -283,10 +296,14 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
             new Thread(renderTask).start();
         }
 
-        public void queue(Set<? extends Cluster<T>> clusters) {
+        public void queue(HashSet<Pair<Algorithm<T>, Set<? extends Cluster<T>>>> sets) {
             synchronized (this) {
                 // Overwrite any pending cluster tasks - we don't care about intermediate states.
-                mNextClusters = new RenderTask(clusters);
+                if (mNextClusters == null) {
+                    mNextClusters = new ArrayDeque<RenderTask>();
+                }
+                mNextClusters.push(new RenderTask(sets));
+//                mNextClusters = new RenderTask(sets);
             }
             sendEmptyMessage(RUN_TASK);
         }
@@ -318,14 +335,15 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
      * out, existing clusters are animated to the nearest new cluster.
      */
     private class RenderTask implements Runnable {
-        final Set<? extends Cluster<T>> clusters;
+        HashSet<Pair<Algorithm<T>, Set<? extends Cluster<T>>>> sets;
         private Runnable mCallback;
         private Projection mProjection;
         private SphericalMercatorProjection mSphericalMercatorProjection;
         private float mMapZoom;
+//        private Algorithm algorithm;
 
-        private RenderTask(Set<? extends Cluster<T>> clusters) {
-            this.clusters = clusters;
+        private RenderTask(HashSet<Pair<Algorithm<T>, Set<? extends Cluster<T>>>> sets) {
+            this.sets = sets;
         }
 
         /**
@@ -345,11 +363,10 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
             this.mMapZoom = zoom;
             this.mSphericalMercatorProjection = new SphericalMercatorProjection(256 * Math.pow(2, Math.min(zoom, mZoom)));
         }
-
-        @SuppressLint("NewApi")
-        public void run() {
-            if (clusters.equals(DefaultClusterRenderer.this.mClusters)) {
-                mCallback.run();
+        
+        private void runOnSet(LatLngBounds visibleBounds, Algorithm<T> algorithm, Set<? extends Cluster<T>> clusters) {
+            Set<? extends Cluster<T>> currentCluster = DefaultClusterRenderer.this.mClusters.get(algorithm);
+            if (clusters == currentCluster) {
                 return;
             }
 
@@ -359,68 +376,77 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
             final boolean zoomingIn = zoom > mZoom;
             final float zoomDelta = zoom - mZoom;
 
-            final Set<MarkerWithPosition> markersToRemove = mMarkers;
-            final LatLngBounds visibleBounds = mProjection.getVisibleRegion().latLngBounds;
+            final Set<MarkerWithPosition> markersToRemove = mMarkers.get(algorithm);
             // TODO: Add some padding, so that markers can animate in from off-screen.
 
             // Find all of the existing clusters that are on-screen. These are candidates for
             // markers to animate from.
             List<Point> existingClustersOnScreen = null;
-            if (DefaultClusterRenderer.this.mClusters != null && SHOULD_ANIMATE) {
+            if (DefaultClusterRenderer.this.mClusters != null && shouldAnimate()) {
                 existingClustersOnScreen = new ArrayList<Point>();
-                for (Cluster<T> c : DefaultClusterRenderer.this.mClusters) {
-                    if (shouldRenderAsCluster(c) && visibleBounds.contains(c.getPosition())) {
-                        Point point = mSphericalMercatorProjection.toPoint(c.getPosition());
-                        existingClustersOnScreen.add(point);
+                if (currentCluster != null) {
+                    for (Cluster<T> c : currentCluster) {
+                        if (shouldRenderAsCluster(c) && visibleBounds.contains(c.getPosition())) {
+                            Point point = mSphericalMercatorProjection.toPoint(c.getPosition());
+                            existingClustersOnScreen.add(point);
+                        }
                     }
                 }
+                
             }
-
-            // Create the new markers and animate them to their new positions.
             final Set<MarkerWithPosition> newMarkers = Collections.newSetFromMap(
                     new ConcurrentHashMap<MarkerWithPosition, Boolean>());
-            for (Cluster<T> c : clusters) {
-                boolean onScreen = visibleBounds.contains(c.getPosition());
-                if (zoomingIn && onScreen && SHOULD_ANIMATE) {
-                    Point point = mSphericalMercatorProjection.toPoint(c.getPosition());
-                    Point closest = findClosestCluster(existingClustersOnScreen, point);
-                    if (closest != null) {
-                        LatLng animateTo = mSphericalMercatorProjection.toLatLng(closest);
-                        markerModifier.add(true, new CreateMarkerTask(c, newMarkers, animateTo));
+            if (clusters != null) {
+             // Create the new markers and animate them to their new positions.
+                for (Cluster<T> c : clusters) {
+                    boolean onScreen = visibleBounds.contains(c.getPosition());
+                    if (zoomingIn && onScreen && shouldAnimate()) {
+                        Point point = mSphericalMercatorProjection.toPoint(c.getPosition());
+                        Point closest = findClosestCluster(existingClustersOnScreen, point);
+                        if (closest != null) {
+                            LatLng animateTo = mSphericalMercatorProjection.toLatLng(closest);
+                            markerModifier.add(true, new CreateMarkerTask(c, algorithm, newMarkers, animateTo));
+                        } else {
+                            markerModifier.add(true, new CreateMarkerTask(c, algorithm, newMarkers, null));
+                        }
                     } else {
-                        markerModifier.add(true, new CreateMarkerTask(c, newMarkers, null));
+                        markerModifier.add(onScreen, new CreateMarkerTask(c, algorithm, newMarkers, null));
                     }
-                } else {
-                    markerModifier.add(onScreen, new CreateMarkerTask(c, newMarkers, null));
                 }
             }
+            
 
             // Wait for all markers to be added.
             markerModifier.waitUntilFree();
 
             // Don't remove any markers that were just added. This is basically anything that had
             // a hit in the MarkerCache.
-            markersToRemove.removeAll(newMarkers);
+            if (markersToRemove != null) {
+                markersToRemove.removeAll(newMarkers);
+            }
 
             // Find all of the new clusters that were added on-screen. These are candidates for
             // markers to animate from.
             List<Point> newClustersOnScreen = null;
-            if (SHOULD_ANIMATE) {
+            if (shouldAnimate()) {
                 newClustersOnScreen = new ArrayList<Point>();
-                for (Cluster<T> c : clusters) {
-                    if (shouldRenderAsCluster(c) && visibleBounds.contains(c.getPosition())) {
-                        Point p = mSphericalMercatorProjection.toPoint(c.getPosition());
-                        newClustersOnScreen.add(p);
+                if (clusters != null) {
+                    for (Cluster<T> c : clusters) {
+                        if (shouldRenderAsCluster(c) && visibleBounds.contains(c.getPosition())) {
+                            Point p = mSphericalMercatorProjection.toPoint(c.getPosition());
+                            newClustersOnScreen.add(p);
+                        }
                     }
                 }
             }
 
+            if (markersToRemove != null) {
             // Remove the old markers, animating them into clusters if zooming out.
             for (final MarkerWithPosition marker : markersToRemove) {
                 boolean onScreen = visibleBounds.contains(marker.position);
                 // Don't animate when zooming out more than 3 zoom levels.
                 // TODO: drop animation based on speed of device & number of markers to animate.
-                if (!zoomingIn && zoomDelta > -3 && onScreen && SHOULD_ANIMATE) {
+                if (!zoomingIn && zoomDelta > -3 && onScreen && shouldAnimate()) {
                     final Point point = mSphericalMercatorProjection.toPoint(marker.position);
                     final Point closest = findClosestCluster(newClustersOnScreen, point);
                     if (closest != null) {
@@ -433,21 +459,33 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
                     markerModifier.remove(onScreen, marker.marker);
                 }
             }
+            }
 
             markerModifier.waitUntilFree();
-
-            mMarkers = newMarkers;
-            DefaultClusterRenderer.this.mClusters = clusters;
+            mMarkers.put(algorithm, newMarkers);
+            if (clusters != null) {
+                DefaultClusterRenderer.this.mClusters.put(algorithm, clusters);
+            } else {
+                DefaultClusterRenderer.this.mClusters.remove(algorithm);
+            }
             mZoom = zoom;
+        }
 
+        @SuppressLint("NewApi")
+        public void run() {
+            final LatLngBounds visibleBounds = mProjection.getVisibleRegion().latLngBounds;
+            for(Pair<Algorithm<T>, Set<? extends Cluster<T>>> pair: sets) {
+                runOnSet(visibleBounds, pair.first, pair.second);
+            }
             mCallback.run();
         }
     }
 
     @Override
-    public void onClustersChanged(Set<? extends Cluster<T>> clusters) {
-        mViewModifier.queue(clusters);
+    public void onClustersChanged(HashSet<Pair<Algorithm<T>, Set<? extends Cluster<T>>>> sets) {
+        mViewModifier.queue(sets);
     }
+    
 
     @Override
     public void setOnClusterClickListener(ClusterManager.OnClusterClickListener<T> listener) {
@@ -558,7 +596,7 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
          */
         public void animate(MarkerWithPosition marker, LatLng from, LatLng to) {
             lock.lock();
-            mAnimationTasks.add(new AnimationTask(marker, from, to));
+            mAnimationTasks.add(new AnimationTask(marker, from, to, false));
             lock.unlock();
         }
 
@@ -572,8 +610,7 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
          */
         public void animateThenRemove(MarkerWithPosition marker, LatLng from, LatLng to) {
             lock.lock();
-            AnimationTask animationTask = new AnimationTask(marker, from, to);
-            animationTask.removeOnAnimationComplete(mClusterManager.getMarkerManager());
+            AnimationTask animationTask = new AnimationTask(marker, from, to, true);
             mAnimationTasks.add(animationTask);
             lock.unlock();
         }
@@ -629,13 +666,7 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
             }
         }
 
-        private void removeMarker(Marker m) {
-            Cluster<T> cluster = mMarkerToCluster.get(m);
-            mClusterToMarker.remove(cluster);
-            mMarkerCache.remove(m);
-            mMarkerToCluster.remove(m);
-            mClusterManager.getMarkerManager().remove(m);
-        }
+        
 
         /**
          * @return true if there is still work to be processed.
@@ -681,7 +712,14 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
             return true;
         }
     }
-
+    protected void removeMarker(Marker m) {
+        m.remove();
+        Cluster<T> cluster = mMarkerToCluster.get(m);
+        mClusterToMarker.remove(cluster);
+        mMarkerCache.remove(m);
+        mMarkerToCluster.remove(m);
+        mClusterManager.getMarkerManager().remove(m);
+    }
     /**
      * A cache of markers representing individual ClusterItems.
      */
@@ -718,8 +756,9 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
     /**
      * Called before the marker for a Cluster is added to the map.
      * The default implementation draws a circle with a rough count of the number of items.
+     * @param algorithm 
      */
-    protected void onBeforeClusterRendered(Cluster<T> cluster, MarkerOptions markerOptions) {
+    protected void onBeforeClusterRendered(Cluster<T> cluster, Algorithm<T> algorithm, MarkerOptions markerOptions) {
         int bucket = getBucket(cluster);
         BitmapDescriptor descriptor = mIcons.get(bucket);
         if (descriptor == null) {
@@ -778,7 +817,11 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
     public Cluster<T> getCluster(Marker marker) {
         return mMarkerToCluster.get(marker);
     }
-
+    
+    
+    protected Marker getMarkerForClusterItem(Algorithm<T> algo, T item) {
+        return null;
+    }
     /**
      * Creates markerWithPosition(s) for a particular cluster, animating it if necessary.
      */
@@ -786,6 +829,7 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
         private final Cluster<T> cluster;
         private final Set<MarkerWithPosition> newMarkers;
         private final LatLng animateFrom;
+        private Algorithm<T> algorithm;
 
         /**
          * @param c            the cluster to render.
@@ -793,11 +837,13 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
          * @param animateFrom  the location to animate the markerWithPosition from, or null if no
          *                     animation is required.
          */
-        public CreateMarkerTask(Cluster<T> c, Set<MarkerWithPosition> markersAdded, LatLng animateFrom) {
+        public CreateMarkerTask(Cluster<T> c, Algorithm<T> algo, Set<MarkerWithPosition> markersAdded, LatLng animateFrom) {
             this.cluster = c;
             this.newMarkers = markersAdded;
             this.animateFrom = animateFrom;
+            this.algorithm = algo;
         }
+
 
         private void perform(MarkerModifier markerModifier) {
             // Don't show small clusters. Render the markers inside, instead.
@@ -806,14 +852,23 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
                     Marker marker = mMarkerCache.get(item);
                     MarkerWithPosition markerWithPosition;
                     if (marker == null) {
-                        MarkerOptions markerOptions = new MarkerOptions();
-                        if (animateFrom != null) {
-                            markerOptions.position(animateFrom);
-                        } else {
-                            markerOptions.position(item.getPosition());
+                        marker = getMarkerForClusterItem(algorithm, item);
+                        if (marker == null) {
+                            MarkerOptions markerOptions = new MarkerOptions();
+                            if (animateFrom != null) {
+                                markerOptions.position(animateFrom);
+                            } else {
+                                markerOptions.position(item.getPosition());
+                            }
+                            onBeforeClusterItemRendered(item, markerOptions);
+                        } else  {
+                          marker = mClusterManager.getMarkerCollection().addMarker(marker);
+                          if (animateFrom != null) {
+                                marker.setPosition(animateFrom);
+                          } else {
+                              marker.setPosition(item.getPosition());
+                          }
                         }
-                        onBeforeClusterItemRendered(item, markerOptions);
-                        marker = mClusterManager.getMarkerCollection().addMarker(markerOptions);
                         markerWithPosition = new MarkerWithPosition(marker);
                         mMarkerCache.put(item, marker);
                         if (animateFrom != null) {
@@ -831,7 +886,7 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
             MarkerOptions markerOptions = new MarkerOptions().
                     position(animateFrom == null ? cluster.getPosition() : animateFrom);
 
-            onBeforeClusterRendered(cluster, markerOptions);
+            onBeforeClusterRendered(cluster, algorithm,  markerOptions);
 
             Marker marker = mClusterManager.getClusterMarkerCollection().addMarker(markerOptions);
             mMarkerToCluster.put(marker, cluster);
@@ -873,6 +928,11 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
     }
 
     private static final TimeInterpolator ANIMATION_INTERP = new DecelerateInterpolator();
+    protected int animationType = ANIMATION_MOVE;
+    
+    public void setAnimationType(final int type) {
+        animationType = type;
+    }
 
     /**
      * Animates a markerWithPosition from one position to another. TODO: improve performance for
@@ -884,14 +944,18 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
         private final Marker marker;
         private final LatLng from;
         private final LatLng to;
-        private boolean mRemoveOnComplete;
-        private MarkerManager mMarkerManager;
+        private final boolean remove;
 
-        private AnimationTask(MarkerWithPosition markerWithPosition, LatLng from, LatLng to) {
+        private AnimationTask(MarkerWithPosition markerWithPosition, final LatLng from, final LatLng to, final boolean remove) {
             this.markerWithPosition = markerWithPosition;
             this.marker = markerWithPosition.marker;
             this.from = from;
             this.to = to;
+            this.remove = remove;
+            if (!remove) {
+                this.marker.setAlpha(0);
+                this.marker.setPosition(to);
+            }
         }
 
         public void perform() {
@@ -904,34 +968,37 @@ public class DefaultClusterRenderer<T extends ClusterItem> implements ClusterRen
 
         @Override
         public void onAnimationEnd(Animator animation) {
-            if (mRemoveOnComplete) {
-                Cluster<T> cluster = mMarkerToCluster.get(marker);
-                mClusterToMarker.remove(cluster);
-                mMarkerCache.remove(marker);
-                mMarkerToCluster.remove(marker);
-                mMarkerManager.remove(marker);
+            if (remove) {
+                removeMarker(marker);
             }
             markerWithPosition.position = to;
-        }
-
-        public void removeOnAnimationComplete(MarkerManager markerManager) {
-            mMarkerManager = markerManager;
-            mRemoveOnComplete = true;
         }
 
         @Override
         public void onAnimationUpdate(ValueAnimator valueAnimator) {
             float fraction = valueAnimator.getAnimatedFraction();
-            double lat = (to.latitude - from.latitude) * fraction + from.latitude;
-            double lngDelta = to.longitude - from.longitude;
+            if (animationType == ANIMATION_FADE) {
+                marker.setAlpha(remove?(1-fraction):fraction);
+            } else {
+                double lat = (to.latitude - from.latitude) * fraction + from.latitude;
+                double lngDelta = to.longitude - from.longitude;
 
-            // Take the shortest path across the 180th meridian.
-            if (Math.abs(lngDelta) > 180) {
-                lngDelta -= Math.signum(lngDelta) * 360;
+                // Take the shortest path across the 180th meridian.
+                if (Math.abs(lngDelta) > 180) {
+                    lngDelta -= Math.signum(lngDelta) * 360;
+                }
+                double lng = lngDelta * fraction + from.longitude;
+                LatLng position = new LatLng(lat, lng);
+                marker.setPosition(position);
             }
-            double lng = lngDelta * fraction + from.longitude;
-            LatLng position = new LatLng(lat, lng);
-            marker.setPosition(position);
+            
         }
     }
+
+    @Override
+    public void clearCache() {
+        // TODO Auto-generated method stub
+        
+    }
+
 }

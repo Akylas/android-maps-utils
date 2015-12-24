@@ -26,6 +26,7 @@ import java.util.Map;
 import java.util.Set;
 
 import com.google.android.gms.maps.model.LatLng;
+import com.google.android.gms.maps.model.LatLngBounds;
 import com.google.maps.android.clustering.Cluster;
 import com.google.maps.android.clustering.ClusterItem;
 import com.google.maps.android.geometry.Bounds;
@@ -84,15 +85,38 @@ public class NonHierarchicalDistanceBasedAlgorithm<T extends ClusterItem> implem
             mQuadTree.clear();
         }
     }
-
+    
     @Override
     public void removeItem(T item) {
-        // TODO: delegate QuadItem#hashCode and QuadItem#equals to its item.
-        throw new UnsupportedOperationException("NonHierarchicalDistanceBasedAlgorithm.remove not implemented");
+        synchronized (mQuadTree) {
+            Set<QuadItem<T>> toRemove = new HashSet<QuadItem<T>>();
+            for (QuadItem<T> quadItem : mItems) {
+                if (item == quadItem.mClusterItem) {
+                    mQuadTree.remove(quadItem);
+                    toRemove.add(quadItem);
+                    mItems.remove(quadItem);
+                    break;
+               }
+            }
+        }
     }
 
     @Override
-    public Set<? extends Cluster<T>> getClusters(double zoom) {
+    public void removeItems(Collection<T> items) {
+        synchronized (mQuadTree) {
+            Set<QuadItem<T>> toRemove = new HashSet<QuadItem<T>>();
+            for (QuadItem<T> quadItem : mItems) {
+                if (items.contains(quadItem.mClusterItem)) {
+                    mQuadTree.remove(quadItem);
+                    toRemove.add(quadItem);
+                }
+            }
+            mItems.removeAll(toRemove);
+        }
+    }
+
+    @Override
+    public Set<? extends Cluster<T>> getClusters(double zoom, LatLngBounds visibleBounds) {
         final int discreteZoom = (int) zoom;
 
         final double zoomSpecificSpan = MAX_DISTANCE_AT_ZOOM / Math.pow(2, discreteZoom) / 256;
@@ -104,8 +128,16 @@ public class NonHierarchicalDistanceBasedAlgorithm<T extends ClusterItem> implem
 
         synchronized (mQuadTree) {
             for (QuadItem<T> candidate : mItems) {
-                if (visitedCandidates.contains(candidate)) {
-                    // Candidate is already part of another cluster.
+                LatLng pos = candidate.getPosition();
+                T item = candidate.getClusterItem();
+                if (visitedCandidates.contains(candidate) || !item.isVisible()) {
+//                if (visitedCandidates.contains(candidate) || !visibleBounds.contains(pos) || !item.isVisible()) {
+                    continue;
+                }
+                
+                if (!item.canBeClustered()) {
+                    visitedCandidates.add(candidate);
+                    results.add(candidate);
                     continue;
                 }
 
@@ -119,7 +151,7 @@ public class NonHierarchicalDistanceBasedAlgorithm<T extends ClusterItem> implem
                     distanceToCluster.put(candidate, 0d);
                     continue;
                 }
-                StaticCluster<T> cluster = new StaticCluster<T>(candidate.mClusterItem.getPosition());
+                StaticCluster<T> cluster = new StaticCluster<T>();
                 results.add(cluster);
 
                 for (QuadItem<T> clusterItem : clusterItems) {
@@ -138,6 +170,11 @@ public class NonHierarchicalDistanceBasedAlgorithm<T extends ClusterItem> implem
                     itemToCluster.put(clusterItem, cluster);
                 }
                 visitedCandidates.addAll(clusterItems);
+            }
+        }
+        for (Cluster<T> cluster: results) {
+            if (cluster instanceof StaticCluster) {
+                ((StaticCluster<T>) cluster).update();
             }
         }
         return results;
@@ -179,6 +216,11 @@ public class NonHierarchicalDistanceBasedAlgorithm<T extends ClusterItem> implem
             mPoint = PROJECTION.toPoint(mPosition);
             singletonSet = Collections.singleton(mClusterItem);
         }
+        
+        public T getClusterItem() {
+            return mClusterItem;
+        }
+
 
         @Override
         public Point getPoint() {
@@ -198,6 +240,20 @@ public class NonHierarchicalDistanceBasedAlgorithm<T extends ClusterItem> implem
         @Override
         public int getSize() {
             return 1;
+        }
+    }
+
+    @Override
+    public void removeItemsNotInRectangle(LatLngBounds bounds) {
+        synchronized (mQuadTree) {
+            Set<QuadItem<T>> toRemove = new HashSet<QuadItem<T>>();
+            for (QuadItem<T> quadItem : mItems) {
+                if (!bounds.contains(quadItem.getPosition())) {
+                    mQuadTree.remove(quadItem);
+                    toRemove.add(quadItem);
+                }
+            }
+            mItems.removeAll(toRemove);
         }
     }
 }

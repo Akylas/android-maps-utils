@@ -18,6 +18,7 @@ package com.google.maps.android.clustering.algo;
 
 import android.support.v4.util.LruCache;
 
+import com.google.android.gms.maps.model.LatLngBounds;
 import com.google.maps.android.clustering.Cluster;
 import com.google.maps.android.clustering.ClusterItem;
 
@@ -38,6 +39,10 @@ public class PreCachingAlgorithmDecorator<T extends ClusterItem> implements Algo
 
     public PreCachingAlgorithmDecorator(Algorithm<T> algorithm) {
         mAlgorithm = algorithm;
+    }
+    
+    public Algorithm<T> getAlgorithm() {
+        return mAlgorithm;
     }
 
     public void addItem(T item) {
@@ -67,15 +72,15 @@ public class PreCachingAlgorithmDecorator<T extends ClusterItem> implements Algo
     }
 
     @Override
-    public Set<? extends Cluster<T>> getClusters(double zoom) {
+    public Set<? extends Cluster<T>> getClusters(double zoom, LatLngBounds visibleBounds) {
         int discreteZoom = (int) zoom;
-        Set<? extends Cluster<T>> results = getClustersInternal(discreteZoom);
+        Set<? extends Cluster<T>> results = getClustersInternal(discreteZoom, visibleBounds);
         // TODO: Check if requests are already in-flight.
         if (mCache.get(discreteZoom + 1) == null) {
-            new Thread(new PrecacheRunnable(discreteZoom + 1)).start();
+            new Thread(new PrecacheRunnable(discreteZoom + 1, visibleBounds)).start();
         }
         if (mCache.get(discreteZoom - 1) == null) {
-            new Thread(new PrecacheRunnable(discreteZoom - 1)).start();
+            new Thread(new PrecacheRunnable(discreteZoom - 1, visibleBounds)).start();
         }
         return results;
     }
@@ -85,7 +90,7 @@ public class PreCachingAlgorithmDecorator<T extends ClusterItem> implements Algo
         return mAlgorithm.getItems();
     }
 
-    private Set<? extends Cluster<T>> getClustersInternal(int discreteZoom) {
+    private Set<? extends Cluster<T>> getClustersInternal(int discreteZoom, LatLngBounds visibleBounds) {
         Set<? extends Cluster<T>> results;
         mCacheLock.readLock().lock();
         results = mCache.get(discreteZoom);
@@ -95,7 +100,7 @@ public class PreCachingAlgorithmDecorator<T extends ClusterItem> implements Algo
             mCacheLock.writeLock().lock();
             results = mCache.get(discreteZoom);
             if (results == null) {
-                results = mAlgorithm.getClusters(discreteZoom);
+                results = mAlgorithm.getClusters(discreteZoom, visibleBounds);
                 mCache.put(discreteZoom, results);
             }
             mCacheLock.writeLock().unlock();
@@ -105,9 +110,11 @@ public class PreCachingAlgorithmDecorator<T extends ClusterItem> implements Algo
 
     private class PrecacheRunnable implements Runnable {
         private final int mZoom;
+        private final LatLngBounds mVisibleBounds;
 
-        public PrecacheRunnable(int zoom) {
+        public PrecacheRunnable(int zoom, LatLngBounds visibleBounds) {
             mZoom = zoom;
+            mVisibleBounds = visibleBounds;
         }
 
         @Override
@@ -118,7 +125,19 @@ public class PreCachingAlgorithmDecorator<T extends ClusterItem> implements Algo
             } catch (InterruptedException e) {
                 // ignore. keep going.
             }
-            getClustersInternal(mZoom);
+            getClustersInternal(mZoom, mVisibleBounds);
         }
+    }
+
+    @Override
+    public void removeItemsNotInRectangle(LatLngBounds bounds) {
+        mAlgorithm.removeItemsNotInRectangle(bounds);
+        clearCache();
+    }
+
+    @Override
+    public void removeItems(Collection<T> items) {
+        mAlgorithm.removeItems(items);
+        clearCache();
     }
 }

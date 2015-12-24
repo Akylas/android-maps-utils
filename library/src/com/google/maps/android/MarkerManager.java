@@ -156,6 +156,12 @@ public class MarkerManager implements GoogleMap.OnInfoWindowClickListener, Googl
             mAllMarkers.put(marker, Collection.this);
             return marker;
         }
+        
+        public Marker addMarker(Marker marker) {
+            mMarkers.add(marker);
+            mAllMarkers.put(marker, Collection.this);
+            return marker;
+        }
 
         public boolean remove(Marker marker) {
             if (mMarkers.remove(marker)) {

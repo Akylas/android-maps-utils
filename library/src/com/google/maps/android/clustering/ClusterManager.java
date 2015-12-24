@@ -19,59 +19,80 @@ package com.google.maps.android.clustering;
 import android.content.Context;
 import android.os.AsyncTask;
 import android.os.Build;
+import android.os.Handler;
+import android.os.Message;
+import android.support.v4.util.Pair;
 
 import com.google.android.gms.maps.GoogleMap;
+import com.google.android.gms.maps.GoogleMap.OnCameraChangeListener;
+import com.google.android.gms.maps.Projection;
 import com.google.android.gms.maps.model.CameraPosition;
+import com.google.android.gms.maps.model.LatLngBounds;
 import com.google.android.gms.maps.model.Marker;
 import com.google.maps.android.MarkerManager;
 import com.google.maps.android.clustering.algo.Algorithm;
-import com.google.maps.android.clustering.algo.NonHierarchicalDistanceBasedAlgorithm;
-import com.google.maps.android.clustering.algo.PreCachingAlgorithmDecorator;
 import com.google.maps.android.clustering.view.ClusterRenderer;
 import com.google.maps.android.clustering.view.DefaultClusterRenderer;
 
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
+import android.util.Log;
+
 /**
  * Groups many items on a map based on zoom level.
  * <p/>
- * ClusterManager should be added to the map as an: <ul> <li>{@link com.google.android.gms.maps.GoogleMap.OnCameraChangeListener}</li>
- * <li>{@link com.google.android.gms.maps.GoogleMap.OnMarkerClickListener}</li> </ul>
+ * ClusterManager should be added to the map as an:
+ * <ul>
+ * <li>{@link com.google.android.gms.maps.GoogleMap.OnCameraChangeListener}</li>
+ * <li>{@link com.google.android.gms.maps.GoogleMap.OnMarkerClickListener}</li>
+ * </ul>
  */
-public class ClusterManager<T extends ClusterItem> implements GoogleMap.OnCameraChangeListener, GoogleMap.OnMarkerClickListener, GoogleMap.OnInfoWindowClickListener {
+public class ClusterManager<T extends ClusterItem>
+        implements GoogleMap.OnCameraChangeListener,
+        GoogleMap.OnMarkerClickListener, GoogleMap.OnInfoWindowClickListener {
     private final MarkerManager mMarkerManager;
     private final MarkerManager.Collection mMarkers;
     private final MarkerManager.Collection mClusterMarkers;
-
-    private Algorithm<T> mAlgorithm;
+    private List<Algorithm<T>> mAlgorithms = null;
     private final ReadWriteLock mAlgorithmLock = new ReentrantReadWriteLock();
     private ClusterRenderer<T> mRenderer;
 
     private GoogleMap mMap;
     private CameraPosition mPreviousCameraPosition;
     private ClusterTask mClusterTask;
+    private HashMap<Algorithm<T>, ClusterTask> mClustersTasks;
     private final ReadWriteLock mClusterTaskLock = new ReentrantReadWriteLock();
 
     private OnClusterItemClickListener<T> mOnClusterItemClickListener;
     private OnClusterInfoWindowClickListener<T> mOnClusterInfoWindowClickListener;
     private OnClusterItemInfoWindowClickListener<T> mOnClusterItemInfoWindowClickListener;
     private OnClusterClickListener<T> mOnClusterClickListener;
+    private OnCameraChangeListener mOnCameraChangeListener;
+    private GoogleMap.OnMarkerClickListener mOnMarkerClickListener;
 
     public ClusterManager(Context context, GoogleMap map) {
         this(context, map, new MarkerManager(map));
     }
 
-    public ClusterManager(Context context, GoogleMap map, MarkerManager markerManager) {
+    public ClusterManager(Context context, GoogleMap map,
+            MarkerManager markerManager) {
         mMap = map;
         mMarkerManager = markerManager;
         mClusterMarkers = markerManager.newCollection();
         mMarkers = markerManager.newCollection();
         mRenderer = new DefaultClusterRenderer<T>(context, map, this);
-        mAlgorithm = new PreCachingAlgorithmDecorator<T>(new NonHierarchicalDistanceBasedAlgorithm<T>());
-        mClusterTask = new ClusterTask();
+        // mAlgorithm = new PreCachingAlgorithmDecorator<T>(new
+        // NonHierarchicalDistanceBasedAlgorithm<T>());
+        mClusterTask = null;
         mRenderer.onAdd();
     }
 
@@ -88,83 +109,202 @@ public class ClusterManager<T extends ClusterItem> implements GoogleMap.OnCamera
     }
 
     public void setRenderer(ClusterRenderer<T> view) {
-        mRenderer.setOnClusterClickListener(null);
-        mRenderer.setOnClusterItemClickListener(null);
+        mClusterTaskLock.writeLock().lock();
+        try {
+            // Attempt to cancel the in-flight request.
+            if (mClustersTasks != null) {
+                Iterator it = mClustersTasks.entrySet().iterator();
+                while (it.hasNext()) {
+                    Map.Entry pairs = (Map.Entry)it.next();
+                    ((ClusterTask) pairs.getValue()).cancel(true);
+                }
+                mClustersTasks.clear();
+            }
+            if (mClusterTask != null) {
+                mClusterTask.cancel(true);
+            }
+            
+        } finally {
+            mClusterTaskLock.writeLock().unlock();
+        }
+        if (mRenderer != null) {
+            mRenderer.setOnClusterClickListener(null);
+            mRenderer.setOnClusterItemClickListener(null);
+            mRenderer.setOnClusterInfoWindowClickListener(null);
+            mRenderer.setOnClusterItemInfoWindowClickListener(null);
+            mRenderer.onRemove();
+        }
+        
         mClusterMarkers.clear();
         mMarkers.clear();
-        mRenderer.onRemove();
         mRenderer = view;
-        mRenderer.onAdd();
-        mRenderer.setOnClusterClickListener(mOnClusterClickListener);
-        mRenderer.setOnClusterInfoWindowClickListener(mOnClusterInfoWindowClickListener);
-        mRenderer.setOnClusterItemClickListener(mOnClusterItemClickListener);
-        mRenderer.setOnClusterItemInfoWindowClickListener(mOnClusterItemInfoWindowClickListener);
-        cluster();
+        if (mRenderer != null) {
+            mRenderer.onAdd();
+            mRenderer.setOnClusterClickListener(mOnClusterClickListener);
+            mRenderer.setOnClusterInfoWindowClickListener(
+                    mOnClusterInfoWindowClickListener);
+            mRenderer.setOnClusterItemClickListener(mOnClusterItemClickListener);
+            mRenderer.setOnClusterItemInfoWindowClickListener(
+                    mOnClusterItemInfoWindowClickListener);
+            cluster();
+        }
+        
     }
 
-    public void setAlgorithm(Algorithm<T> algorithm) {
+    public void addClusterAlgorithm(Algorithm<T> clusterAlgorithm) {
+        if (clusterAlgorithm == null) {
+            return;
+        }
+        mAlgorithmLock.writeLock().lock();
+        if (mAlgorithms == null) {
+            mAlgorithms = new ArrayList<Algorithm<T>>();
+        }
+        if (!mAlgorithms.contains(clusterAlgorithm)) {
+            mAlgorithms.add(clusterAlgorithm);
+        }
+        mAlgorithmLock.writeLock().unlock();
+        clusterAlgo(clusterAlgorithm);
+    }
+
+    public void removeClusterAlgorithm(Algorithm<T> clusterAlgorithm) {
+        if (clusterAlgorithm == null) {
+            return;
+        }
+        mAlgorithmLock.writeLock().lock();
+        mAlgorithms.remove(clusterAlgorithm);
+        mAlgorithmLock.writeLock().unlock();
+        HashSet<Pair<Algorithm<T>, Set<? extends Cluster<T>>>> sets = new HashSet<Pair<Algorithm<T>, Set<? extends Cluster<T>>>>() {
+        };
+        sets.add(new Pair<Algorithm<T>, Set<? extends Cluster<T>>>(
+                clusterAlgorithm, null));
+        mRenderer.onClustersChanged(sets);
+
+    }
+
+    public void clearItems(Algorithm algo) {
+        if (algo == null) {
+            return;
+        }
         mAlgorithmLock.writeLock().lock();
         try {
-            if (mAlgorithm != null) {
-                algorithm.addItems(mAlgorithm.getItems());
-            }
-            mAlgorithm = new PreCachingAlgorithmDecorator<T>(algorithm);
+            algo.clearItems();
         } finally {
             mAlgorithmLock.writeLock().unlock();
         }
-        cluster();
+        clusterAlgo(algo);
     }
 
-    public void clearItems() {
+    public void addItems(Collection<T> items, Algorithm algo) {
+        if (algo == null) {
+            return;
+        }
         mAlgorithmLock.writeLock().lock();
         try {
-            mAlgorithm.clearItems();
+            algo.addItems(items);
         } finally {
             mAlgorithmLock.writeLock().unlock();
         }
+        clusterAlgo(algo);
     }
 
-    public void addItems(Collection<T> items) {
+    public void addItem(T myItem, Algorithm algo) {
+        if (algo == null) {
+            return;
+        }
         mAlgorithmLock.writeLock().lock();
         try {
-            mAlgorithm.addItems(items);
+            algo.addItem(myItem);
         } finally {
             mAlgorithmLock.writeLock().unlock();
         }
-
+        clusterAlgo(algo);
     }
 
-    public void addItem(T myItem) {
+    public void removeItem(T item, Algorithm algo) {
+        if (algo == null) {
+            return;
+        }
         mAlgorithmLock.writeLock().lock();
         try {
-            mAlgorithm.addItem(myItem);
+            algo.removeItem(item);
         } finally {
             mAlgorithmLock.writeLock().unlock();
         }
-    }
-
-    public void removeItem(T item) {
-        mAlgorithmLock.writeLock().lock();
-        try {
-            mAlgorithm.removeItem(item);
-        } finally {
-            mAlgorithmLock.writeLock().unlock();
-        }
+        clusterAlgo(algo);
     }
 
     /**
      * Force a re-cluster. You may want to call this after adding new item(s).
      */
     public void cluster() {
+        if (mMap == null) {
+            return;
+        }
+        CameraPosition pos = mMap.getCameraPosition();
+        Projection projection = mMap.getProjection();
+        if (pos == null) {
+            return;
+        }
+        final float zoom = pos.zoom;
         mClusterTaskLock.writeLock().lock();
         try {
             // Attempt to cancel the in-flight request.
-            mClusterTask.cancel(true);
-            mClusterTask = new ClusterTask();
+            if (mClustersTasks != null) {
+                Iterator it = mClustersTasks.entrySet().iterator();
+                while (it.hasNext()) {
+                    Map.Entry pairs = (Map.Entry)it.next();
+                    ((ClusterTask) pairs.getValue()).cancel(true);
+                }
+                mClustersTasks.clear();
+            }
+            if (mClusterTask != null) {
+                mClusterTask.cancel(true);
+            }
+            mClusterTask = new ClusterTask(null);
             if (Build.VERSION.SDK_INT < Build.VERSION_CODES.HONEYCOMB) {
-                mClusterTask.execute(mMap.getCameraPosition().zoom);
+                mClusterTask.execute(zoom,
+                        projection.getVisibleRegion().latLngBounds);
             } else {
-                mClusterTask.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR, mMap.getCameraPosition().zoom);
+                mClusterTask.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR,
+                        zoom, projection.getVisibleRegion().latLngBounds);
+            }
+        } finally {
+            mClusterTaskLock.writeLock().unlock();
+        }
+    }
+
+    /**
+     * Force a re-cluster. You may want to call this after adding new item(s).
+     */
+    public void clusterAlgo(Algorithm algo) {
+        if (mMap == null || mClusterTask != null) {
+            return;
+        }
+        CameraPosition pos = mMap.getCameraPosition();
+        Projection projection = mMap.getProjection();
+        if (pos == null) {
+            return;
+        }
+        final float zoom = pos.zoom;
+        mClusterTaskLock.writeLock().lock();
+        try {
+            ClusterTask task = null;
+            if (mClustersTasks != null) {
+                task = mClustersTasks.get(algo);
+                if (task != null) {
+                    task.cancel(true);
+                }
+            } else {
+                mClustersTasks = new HashMap<Algorithm<T>, ClusterTask>();
+            }
+            task = new ClusterTask(algo);
+            mClustersTasks.put(algo, task);
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.HONEYCOMB) {
+                task.execute(zoom,
+                        projection.getVisibleRegion().latLngBounds);
+            } else {
+                task.executeOnExecutor(AsyncTask.THREAD_POOL_EXECUTOR,
+                        zoom, projection.getVisibleRegion().latLngBounds);
             }
         } finally {
             mClusterTaskLock.writeLock().unlock();
@@ -176,25 +316,48 @@ public class ClusterManager<T extends ClusterItem> implements GoogleMap.OnCamera
      *
      * @param cameraPosition
      */
+    
+    Handler cameraHandler = new CameraChangeHandler();
+    private static final int MESSAGE_CLUSTER = 0;
+    class CameraChangeHandler extends Handler {
+            @Override
+            public void handleMessage(Message msg) {
+              if (msg.what ==  MESSAGE_CLUSTER) {
+                  cluster();
+              }
+            }
+        }
+    
     @Override
     public void onCameraChange(CameraPosition cameraPosition) {
         if (mRenderer instanceof GoogleMap.OnCameraChangeListener) {
-            ((GoogleMap.OnCameraChangeListener) mRenderer).onCameraChange(cameraPosition);
+            ((GoogleMap.OnCameraChangeListener) mRenderer)
+                    .onCameraChange(cameraPosition);
         }
 
-        // Don't re-compute clusters if the map has just been panned/tilted/rotated.
+        // Don't re-compute clusters if the map has just been
+        // panned/tilted/rotated.
         CameraPosition position = mMap.getCameraPosition();
-        if (mPreviousCameraPosition != null && mPreviousCameraPosition.zoom == position.zoom) {
-            return;
+        if (mPreviousCameraPosition == null
+                || (mPreviousCameraPosition.zoom != position.zoom)) {
+            cameraHandler.removeMessages(MESSAGE_CLUSTER);
+            cameraHandler.sendEmptyMessageDelayed(MESSAGE_CLUSTER, 300);
         }
         mPreviousCameraPosition = mMap.getCameraPosition();
-
-        cluster();
+        if (mOnCameraChangeListener != null) {
+            mOnCameraChangeListener.onCameraChange(cameraPosition);
+        }
     }
 
     @Override
     public boolean onMarkerClick(Marker marker) {
-        return getMarkerManager().onMarkerClick(marker);
+        if (getMarkerManager().onMarkerClick(marker)) {
+            return true;
+        }
+        if (mOnMarkerClickListener != null) {
+            return mOnMarkerClickListener.onMarkerClick(marker);
+        }
+        return false;
     }
 
     @Override
@@ -202,60 +365,139 @@ public class ClusterManager<T extends ClusterItem> implements GoogleMap.OnCamera
         getMarkerManager().onInfoWindowClick(marker);
     }
 
-    /**
-     * Runs the clustering algorithm in a background thread, then re-paints when results come back.
-     */
-    private class ClusterTask extends AsyncTask<Float, Void, Set<? extends Cluster<T>>> {
-        @Override
-        protected Set<? extends Cluster<T>> doInBackground(Float... zoom) {
-            mAlgorithmLock.readLock().lock();
-            try {
-                return mAlgorithm.getClusters(zoom[0]);
-            } finally {
-                mAlgorithmLock.readLock().unlock();
+    public void removeItems() {
+        mAlgorithmLock.readLock().lock();
+        try {
+            for (Algorithm algo : mAlgorithms) {
+                algo.clearItems();
             }
+        } finally {
+            mAlgorithmLock.readLock().unlock();
         }
+        mRenderer.clearCache();
+    }
 
-        @Override
-        protected void onPostExecute(Set<? extends Cluster<T>> clusters) {
-            mRenderer.onClustersChanged(clusters);
+    public void removeItemsNotInRectangle(LatLngBounds bounds) {
+        mAlgorithmLock.readLock().lock();
+        try {
+            for (Algorithm algo : mAlgorithms) {
+                algo.removeItemsNotInRectangle(bounds);
+            }
+        } finally {
+            mAlgorithmLock.readLock().unlock();
         }
     }
 
     /**
-     * Sets a callback that's invoked when a Cluster is tapped. Note: For this listener to function,
-     * the ClusterManager must be added as a click listener to the map.
+     * Runs the clustering algorithm in a background thread, then re-paints when
+     * results come back.
+     */
+    private class ClusterTask extends
+            AsyncTask<Object, Void, HashSet<Pair<Algorithm<T>, Set<? extends Cluster<T>>>>> {
+        private final Algorithm algorithm;
+
+        public ClusterTask(Algorithm algorithm) {
+            super();
+            this.algorithm = algorithm;
+        }
+
+        @SuppressWarnings({ "serial", "finally" })
+        @Override
+        protected HashSet<Pair<Algorithm<T>, Set<? extends Cluster<T>>>> doInBackground(
+                Object... args) {
+            Float zoom = (Float) args[0];
+            LatLngBounds region = (LatLngBounds) args[1];
+            HashSet<Pair<Algorithm<T>, Set<? extends Cluster<T>>>> sets = new HashSet<Pair<Algorithm<T>, Set<? extends Cluster<T>>>>() {
+            };
+            if (algorithm != null) {
+                sets.add(new Pair<Algorithm<T>, Set<? extends Cluster<T>>>(
+                        algorithm, algorithm.getClusters(zoom, region)));
+                return sets;
+            } else {
+                mAlgorithmLock.readLock().lock();
+                try {
+                    for (Algorithm algo : mAlgorithms) {
+                        sets.add(
+                                new Pair<Algorithm<T>, Set<? extends Cluster<T>>>(
+                                        algo, algo.getClusters(zoom, region)));
+                    }
+                } finally {
+                    mAlgorithmLock.readLock().unlock();
+                    return sets;
+                }
+            }
+
+        }
+
+        @Override
+        protected void onPostExecute(
+                HashSet<Pair<Algorithm<T>, Set<? extends Cluster<T>>>> sets) {
+            if (algorithm != null) {
+                mClustersTasks.remove(algorithm);
+            } else {
+                mClusterTask = null;
+            }
+            mRenderer.onClustersChanged(sets);
+        }
+    }
+
+    /**
+     * Sets a callback that's invoked when a Cluster is tapped. Note: For this
+     * listener to function, the ClusterManager must be added as a click
+     * listener to the map.
      */
     public void setOnClusterClickListener(OnClusterClickListener<T> listener) {
         mOnClusterClickListener = listener;
-        mRenderer.setOnClusterClickListener(listener);
+        if (mRenderer != null) {
+            mRenderer.setOnClusterClickListener(listener);
+        }
     }
 
     /**
-     * Sets a callback that's invoked when a Cluster is tapped. Note: For this listener to function,
-     * the ClusterManager must be added as a info window click listener to the map.
+     * Sets a callback that's invoked when a Cluster is tapped. Note: For this
+     * listener to function, the ClusterManager must be added as a info window
+     * click listener to the map.
      */
-    public void setOnClusterInfoWindowClickListener(OnClusterInfoWindowClickListener<T> listener) {
+    public void setOnClusterInfoWindowClickListener(
+            OnClusterInfoWindowClickListener<T> listener) {
         mOnClusterInfoWindowClickListener = listener;
-        mRenderer.setOnClusterInfoWindowClickListener(listener);
+        if (mRenderer != null) {
+            mRenderer.setOnClusterInfoWindowClickListener(listener);
+        }
     }
 
     /**
-     * Sets a callback that's invoked when an individual ClusterItem is tapped. Note: For this
-     * listener to function, the ClusterManager must be added as a click listener to the map.
+     * Sets a callback that's invoked when an individual ClusterItem is tapped.
+     * Note: For this listener to function, the ClusterManager must be added as
+     * a click listener to the map.
      */
-    public void setOnClusterItemClickListener(OnClusterItemClickListener<T> listener) {
+    public void setOnClusterItemClickListener(
+            OnClusterItemClickListener<T> listener) {
         mOnClusterItemClickListener = listener;
-        mRenderer.setOnClusterItemClickListener(listener);
+        if (mRenderer != null) {
+            mRenderer.setOnClusterItemClickListener(listener);
+        }
     }
 
     /**
-     * Sets a callback that's invoked when an individual ClusterItem's Info Window is tapped. Note: For this
-     * listener to function, the ClusterManager must be added as a info window click listener to the map.
+     * Sets a callback that's invoked when an individual ClusterItem's Info
+     * Window is tapped. Note: For this listener to function, the ClusterManager
+     * must be added as a info window click listener to the map.
      */
-    public void setOnClusterItemInfoWindowClickListener(OnClusterItemInfoWindowClickListener<T> listener) {
+    public void setOnClusterItemInfoWindowClickListener(
+            OnClusterItemInfoWindowClickListener<T> listener) {
         mOnClusterItemInfoWindowClickListener = listener;
-        mRenderer.setOnClusterItemInfoWindowClickListener(listener);
+        if (mRenderer != null) {
+            mRenderer.setOnClusterItemInfoWindowClickListener(listener);
+        }
+    }
+
+    public void setOnCameraChangeListener(OnCameraChangeListener listener) {
+        mOnCameraChangeListener = listener;
+    }
+    
+    public void setOnMarkerClickListener(GoogleMap.OnMarkerClickListener listener) {
+        mOnMarkerClickListener = listener;
     }
 
     /**

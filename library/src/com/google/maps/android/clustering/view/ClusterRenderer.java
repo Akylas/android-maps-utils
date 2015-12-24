@@ -16,10 +16,15 @@
 
 package com.google.maps.android.clustering.view;
 
+import com.google.android.gms.maps.GoogleMap;
 import com.google.maps.android.clustering.Cluster;
 import com.google.maps.android.clustering.ClusterItem;
 import com.google.maps.android.clustering.ClusterManager;
+import com.google.maps.android.clustering.algo.Algorithm;
 
+import android.support.v4.util.Pair;
+
+import java.util.HashSet;
 import java.util.Set;
 
 /**
@@ -31,7 +36,7 @@ public interface ClusterRenderer<T extends ClusterItem> {
      * Called when the view needs to be updated because new clusters need to be displayed.
      * @param clusters the clusters to be displayed.
      */
-    void onClustersChanged(Set<? extends Cluster<T>> clusters);
+    void onClustersChanged(HashSet<Pair<Algorithm<T>, Set<? extends Cluster<T>>>> sets);
 
     void setOnClusterClickListener(ClusterManager.OnClusterClickListener<T> listener);
 
@@ -50,4 +55,6 @@ public interface ClusterRenderer<T extends ClusterItem> {
      * Called when the view is removed.
      */
     void onRemove();
+
+    void clearCache();
 }
